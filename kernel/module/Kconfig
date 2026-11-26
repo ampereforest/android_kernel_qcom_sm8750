@@ -264,7 +264,7 @@ config APEX_RELAX_GKI_MODULE_KMI
 	  this device.
 
 	  Trade-off. Unsigned modules are no longer confined to a vetted symbol
-	  set. On a kernel that already grants root through SukiSU that boundary
+	  set. On a kernel that already grants root through KernelSU that boundary
 	  protects little, but it is not nothing. Enabling this can also load a
 	  second Bluetooth stack on top of the working vendor one, which may break
 	  Bluetooth rather than fix it. Test it, do not assume it.
