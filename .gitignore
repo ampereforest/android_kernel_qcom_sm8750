@@ -174,3 +174,7 @@ sphinx_*/
 
 # Rust analyzer configuration
 /rust-project.json
+
+# Track GitHub Actions CI workflow, scripts, patches, and AnyKernel3 template
+!.github/
+!.github/**

@@ -1,0 +1,269 @@
+name: Build 6.6.163-tarostream GKI Drop-In Kernel
+
+on:
+  push:
+    branches:
+      - tarostream-6.6.163
+      - main
+      - lineage-23.2
+    paths-ignore:
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'findings/**'
+  workflow_dispatch:
+    inputs:
+      clang_version:
+        description: 'AOSP main-kernel prebuilt Clang directory (e.g. clang-r614150 or clang-r547379)'
+        required: false
+        default: 'clang-r614150'
+        type: choice
+        options:
+          - clang-r614150
+          - clang-r596125
+          - clang-r584948b
+          - clang-r547379
+      fetch_latest_ksu:
+        description: 'Pull latest tiann/KernelSU main at build time (recommended)'
+        required: false
+        default: true
+        type: boolean
+      lto_mode:
+        description: 'LTO mode (thin = ThinLTO default, none = disable LTO)'
+        required: false
+        default: 'thin'
+        type: choice
+        options:
+          - thin
+          - none
+
+concurrency:
+  group: tarostream-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build 6.6.163-tarostream (arm64 GKI)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Free maximum disk space on runner
+        run: |
+          set -euo pipefail
+          echo "=== Disk before cleanup ==="
+          df -h / /mnt || df -h
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            /usr/local/share/chromium \
+            /usr/local/share/edge_driver \
+            /usr/local/share/gecko_driver \
+            /usr/local/share/chromedriver || true
+          docker image prune -af 2>/dev/null || true
+          docker builder prune -af 2>/dev/null || true
+          sudo apt-get clean
+          echo "=== Disk after cleanup ==="
+          df -h / /mnt || df -h
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install kernel build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex lz4 dwarves libssl-dev libelf-dev cpio \
+            xz-utils zstd python3 zip unzip rsync kmod curl ca-certificates git
+
+      - name: Fetch latest compatible AOSP prebuilt Clang
+        env:
+          CLANG_VERSION: ${{ inputs.clang_version || 'clang-r614150' }}
+        run: |
+          set -euo pipefail
+          CLANG_DIR="${RUNNER_TEMP}/clang"
+          mkdir -p "$CLANG_DIR"
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main-kernel/${CLANG_VERSION}.tar.gz"
+          echo "Downloading AOSP Clang ${CLANG_VERSION} from ${URL}"
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors "$URL" | tar -xz -C "$CLANG_DIR"
+          echo "${CLANG_DIR}/bin" >> "$GITHUB_PATH"
+          export PATH="${CLANG_DIR}/bin:${PATH}"
+          CLANG_VER_STR="$("${CLANG_DIR}/bin/clang" --version | head -n1)"
+          echo "CLANG_VERSION=${CLANG_VERSION}" >> "$GITHUB_ENV"
+          echo "CLANG_VER_STR=${CLANG_VER_STR}" >> "$GITHUB_ENV"
+          echo "Installed: ${CLANG_VER_STR}"
+          "${CLANG_DIR}/bin/ld.lld" --version | head -n1
+
+      - name: Fetch & integrate latest tiann/KernelSU (main) with SUSFS
+        env:
+          FETCH_LATEST_KSU: ${{ inputs.fetch_latest_ksu != false && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          if [ "$FETCH_LATEST_KSU" != "true" ]; then
+            echo "Using vendored drivers/kernelsu (KSU_VERSION=32736)"
+            echo "KSU_VERSION=32736" >> "$GITHUB_ENV"
+            echo "KSU_COMMIT=vendored-cfc60f8d" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          KSU_DIR="${RUNNER_TEMP}/KernelSU"
+          rm -rf "$KSU_DIR"
+          git clone --single-branch -b main https://github.com/tiann/KernelSU.git "$KSU_DIR"
+          KSU_COMMIT="$(git -C "$KSU_DIR" rev-parse HEAD)"
+          KSU_COUNT="$(git -C "$KSU_DIR" rev-list --count HEAD)"
+          KSU_VERSION="$((30000 + KSU_COUNT))"
+          echo "Fetched tiann/KernelSU main @ ${KSU_COMMIT} (count=${KSU_COUNT} -> KSU_VERSION=${KSU_VERSION})"
+          if [ "$KSU_VERSION" -le 32680 ]; then
+            echo "ERROR: KSU_VERSION=${KSU_VERSION} is unexpectedly <= 32680 (shallow clone?)" >&2
+            exit 1
+          fi
+
+          # Apply SUSFS enable patch onto fresh tiann/KernelSU main
+          LOCAL_PATCH="${GITHUB_WORKSPACE}/.github/patches/10_enable_susfs_for_ksu.patch"
+          PATCH_TO_APPLY="$LOCAL_PATCH"
+          if ! patch -d "$KSU_DIR" -p1 --dry-run --forward -f < "$LOCAL_PATCH" >/dev/null 2>&1; then
+            echo "Local 10_enable_susfs_for_ksu.patch did not dry-run clean; fetching latest upstream susfs4ksu patch..."
+            UPSTREAM_PATCH="${RUNNER_TEMP}/10_enable_susfs_for_ksu.patch"
+            curl -fsSL --retry 5 --retry-delay 5 \
+              "https://gitlab.com/simonpunk/susfs4ksu/-/raw/gki-android15-6.6/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" \
+              -o "$UPSTREAM_PATCH"
+            PATCH_TO_APPLY="$UPSTREAM_PATCH"
+          fi
+          patch -d "$KSU_DIR" -p1 --forward < "$PATCH_TO_APPLY"
+          REJ="$(find "$KSU_DIR" -name '*.rej' -print -quit)"
+          if [ -n "$REJ" ]; then
+            echo "ERROR: SUSFS enable patch left rejects: $REJ" >&2
+            exit 1
+          fi
+
+          # Guard selinux_hide.c pointer-bool-conversion under Clang -Werror (idempotent)
+          SELINUX_HIDE="$KSU_DIR/kernel/feature/selinux_hide.c"
+          if [ -f "$SELINUX_HIDE" ] && grep -q "extern void security_dump_masked_av_fn" "$SELINUX_HIDE"; then
+            sed -i 's/if (security_dump_masked_av_fn)/if (\&security_dump_masked_av_fn)/g' "$SELINUX_HIDE"
+            sed -i 's/if (security_dump_masked_av_fn != NULL)/if (\&security_dump_masked_av_fn != NULL)/g' "$SELINUX_HIDE"
+            sed -i 's/if (context_struct_compute_av_fn)/if (\&context_struct_compute_av_fn)/g' "$SELINUX_HIDE"
+            sed -i 's/if (context_struct_compute_av_fn != NULL)/if (\&context_struct_compute_av_fn != NULL)/g' "$SELINUX_HIDE"
+          fi
+
+          # Install patched KernelSU kernel tree cleanly into drivers/kernelsu
+          rm -rf drivers/kernelsu
+          cp -a "$KSU_DIR/kernel" drivers/kernelsu
+          if [ -L drivers/kernelsu/include/uapi ]; then
+            rm -f drivers/kernelsu/include/uapi
+            cp -a "$KSU_DIR/uapi" drivers/kernelsu/include/uapi
+          fi
+
+          # Pin dynamically computed KSU_VERSION in drivers/kernelsu/Kbuild fallback
+          KSU_VERSION="$KSU_VERSION" python3 - <<'PY'
+          import os
+          p = "drivers/kernelsu/Kbuild"
+          ver = os.environ["KSU_VERSION"]
+          s = open(p).read()
+          old = "ccflags-y += -DKSU_VERSION=16"
+          new = f"KSU_VERSION ?= {ver}\nccflags-y += -DKSU_VERSION=$(KSU_VERSION)"
+          if old in s:
+              s = s.replace(old, new, 1)
+          elif "KSU_VERSION ?=" not in s:
+              s += f"\nKSU_VERSION := {ver}\nccflags-y += -DKSU_VERSION=$(KSU_VERSION)\n"
+          open(p, "w").write(s)
+          PY
+
+          echo "KSU_VERSION=${KSU_VERSION}" >> "$GITHUB_ENV"
+          echo "KSU_COMMIT=${KSU_COMMIT}" >> "$GITHUB_ENV"
+          echo "Integrated tiann/KernelSU main (${KSU_COMMIT:0:12}, KSU_VERSION=${KSU_VERSION})"
+
+      - name: Compile 6.6.163-tarostream Image & Module.symvers
+        env:
+          LTO_MODE: ${{ inputs.lto_mode || 'thin' }}
+        run: |
+          set -euo pipefail
+          MAKE_ARGS=(
+            O=out
+            ARCH=arm64
+            LLVM=1
+            LLVM_IAS=1
+            CROSS_COMPILE=aarch64-linux-gnu-
+            LOCALVERSION=
+            KBUILD_BUILD_USER=tarostream
+            KBUILD_BUILD_HOST=tarostream
+            KSU_VERSION="${KSU_VERSION}"
+          )
+          mkdir -p out
+          make "${MAKE_ARGS[@]}" gki_defconfig
+
+          if [ "$LTO_MODE" = "none" ]; then
+            scripts/config --file out/.config -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE
+            make "${MAKE_ARGS[@]}" olddefconfig
+          fi
+
+          # Install UAPI headers first so KernelSU Kbuild enables preinit/runner.elf cleanly
+          make -j"$(nproc)" "${MAKE_ARGS[@]}" headers_install
+
+          # Build Image + in-tree modules so Module.symvers is generated for ABI verification
+          make -j"$(nproc)" "${MAKE_ARGS[@]}" Image modules
+
+          ls -lh out/arch/arm64/boot/Image out/Module.symvers out/vmlinux.symvers || true
+
+      - name: Run CI Boot-Safety Gate
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_boot_safety.py \
+            --src . \
+            --out out \
+            --report out/boot-safety-report.txt
+
+      - name: Package AnyKernel3 flashable ZIP
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          ZIP_NAME="AnyKernel3-tarostream-6.6.163-${SHORT_SHA}.zip"
+          AK3_DIR="${RUNNER_TEMP}/AnyKernel3"
+          OUT_ART="${GITHUB_WORKSPACE}/artifacts"
+          rm -rf "$AK3_DIR" "$OUT_ART"
+          mkdir -p "$OUT_ART"
+
+          git clone --depth=1 -b gki-2.0 https://github.com/WildKernels/AnyKernel3.git "$AK3_DIR"
+          rm -rf "$AK3_DIR/.git" "$AK3_DIR/README.md" "$AK3_DIR/anykernel.sh"
+          cp -f .github/anykernel/anykernel.sh "$AK3_DIR/anykernel.sh"
+          sed -i \
+            -e "s|__KSU_VERSION__|${KSU_VERSION} (${KSU_COMMIT:0:8})|g" \
+            -e "s|__BUILD_SHA__|${SHORT_SHA}|g" \
+            -e "s|__CLANG_VER__|${CLANG_VERSION}|g" \
+            "$AK3_DIR/anykernel.sh"
+          chmod 0755 "$AK3_DIR/anykernel.sh"
+          cp -f out/arch/arm64/boot/Image "$AK3_DIR/Image"
+
+          (cd "$AK3_DIR" && zip -r9 "${OUT_ART}/${ZIP_NAME}" .)
+          (cd "$OUT_ART" && sha256sum "${ZIP_NAME}" > "${ZIP_NAME}.sha256")
+          cp -f out/.config "${OUT_ART}/tarostream-6.6.163-${SHORT_SHA}.config"
+          cp -f out/boot-safety-report.txt "${OUT_ART}/boot-safety-report.txt"
+          ls -lh "$OUT_ART"
+
+          {
+            echo "## 6.6.163-tarostream Build Summary"
+            echo ""
+            echo "- **Artifact:** \`${ZIP_NAME}\`"
+            echo "- **Kernel:** \`$(sed -n 's/.*"\\([^"]*\\)".*/\\1/p' out/include/generated/utsrelease.h)\`"
+            echo "- **Toolchain:** \`${CLANG_VERSION}\` (\`${CLANG_VER_STR}\`)"
+            echo "- **KernelSU:** \`tiann/KernelSU\` main @ \`${KSU_COMMIT:0:12}\` (\`KSU_VERSION=${KSU_VERSION}\`)"
+            echo "- **Features:** SUSFS v2.4.0 + NoMount + DroidSpaces + BORE + ADIOS + NTsync + Thermal/Power Efficiency"
+            echo ""
+            echo '```text'
+            cat out/boot-safety-report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "ZIP_NAME=${ZIP_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload AnyKernel3 ZIP & verification artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AnyKernel3-tarostream-6.6.163-${{ github.sha }}
+          path: artifacts/**
+          if-no-files-found: error
+          retention-days: 30
