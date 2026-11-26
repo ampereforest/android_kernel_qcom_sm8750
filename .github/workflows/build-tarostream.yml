@@ -81,16 +81,27 @@ jobs:
             bc bison flex lz4 dwarves libssl-dev libelf-dev cpio \
             xz-utils zstd python3 zip unzip rsync kmod curl ca-certificates git
 
+      - name: Restore cached AOSP prebuilt Clang
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/clang
+          key: aosp-clang-v1-${{ inputs.clang_version || 'clang-r614150' }}
+
       - name: Fetch latest compatible AOSP prebuilt Clang
         env:
           CLANG_VERSION: ${{ inputs.clang_version || 'clang-r614150' }}
         run: |
           set -euo pipefail
           CLANG_DIR="${RUNNER_TEMP}/clang"
-          mkdir -p "$CLANG_DIR"
-          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main-kernel/${CLANG_VERSION}.tar.gz"
-          echo "Downloading AOSP Clang ${CLANG_VERSION} from ${URL}"
-          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors "$URL" | tar -xz -C "$CLANG_DIR"
+          if [ ! -x "${CLANG_DIR}/bin/clang" ]; then
+            mkdir -p "$CLANG_DIR"
+            URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main-kernel/${CLANG_VERSION}.tar.gz"
+            echo "Downloading AOSP Clang ${CLANG_VERSION} from ${URL}"
+            curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors "$URL" | tar -xz -C "$CLANG_DIR"
+          else
+            echo "Using cached AOSP Clang ${CLANG_VERSION} from ${CLANG_DIR}"
+          fi
           echo "${CLANG_DIR}/bin" >> "$GITHUB_PATH"
           export PATH="${CLANG_DIR}/bin:${PATH}"
           CLANG_VER_STR="$("${CLANG_DIR}/bin/clang" --version | head -n1)"
@@ -101,7 +112,7 @@ jobs:
 
       - name: Fetch & integrate latest tiann/KernelSU (main) with SUSFS
         env:
-          FETCH_LATEST_KSU: ${{ inputs.fetch_latest_ksu != false && 'true' || 'false' }}
+          FETCH_LATEST_KSU: ${{ github.event_name == 'workflow_dispatch' && !inputs.fetch_latest_ksu && 'false' || 'true' }}
         run: |
           set -euo pipefail
           if [ "$FETCH_LATEST_KSU" != "true" ]; then

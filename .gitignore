@@ -178,3 +178,5 @@ sphinx_*/
 # Track GitHub Actions CI workflow, scripts, patches, and AnyKernel3 template
 !.github/
 !.github/**
+.github/**/__pycache__/
+.github/**/*.pyc

@@ -116,7 +116,7 @@ CRITICAL_VENDOR_SYMBOLS = [
     "drm_atomic_helper_check",
     "drm_dev_register",
     # Wireless / BT / net
-    "cfg80211_register_netdevice",
+    "register_netdev",
     "rfkill_alloc",
     "netif_rx",
     "__netdev_alloc_skb",
