@@ -23,7 +23,7 @@ on:
           - clang-r584948b
           - clang-r547379
       fetch_latest_ksu:
-        description: 'Pull latest tiann/KernelSU main at build time (recommended)'
+        description: 'Pull latest upstream root manager kernel sources at build time (recommended)'
         required: false
         default: true
         type: boolean
@@ -42,11 +42,25 @@ concurrency:
 
 jobs:
   build:
-    name: Build 6.6.163-tarostream (arm64 GKI)
+    name: Build 6.6.163-tarostream (${{ matrix.root_flavor }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        root_flavor:
+          - kernelsu
+          - bakasu
 
     steps:
+      - name: Compute build metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "SHORT_SHA=${SHORT_SHA}" >> "$GITHUB_ENV"
+
       - name: Free maximum disk space on runner
         run: |
           set -euo pipefail
@@ -110,15 +124,20 @@ jobs:
           echo "Installed: ${CLANG_VER_STR}"
           "${CLANG_DIR}/bin/ld.lld" --version | head -n1
 
-      - name: Fetch & integrate latest tiann/KernelSU (main) with SUSFS
+      - name: Fetch & integrate tiann/KernelSU (main) with SUSFS
+        if: matrix.root_flavor == 'kernelsu'
         env:
           FETCH_LATEST_KSU: ${{ github.event_name == 'workflow_dispatch' && !inputs.fetch_latest_ksu && 'false' || 'true' }}
         run: |
           set -euo pipefail
+          echo "ROOT_NAME=KernelSU" >> "$GITHUB_ENV"
+          echo "ROOT_REPO=tiann/KernelSU" >> "$GITHUB_ENV"
+
           if [ "$FETCH_LATEST_KSU" != "true" ]; then
             echo "Using vendored drivers/kernelsu (KSU_VERSION=32736)"
             echo "KSU_VERSION=32736" >> "$GITHUB_ENV"
             echo "KSU_COMMIT=vendored-cfc60f8d" >> "$GITHUB_ENV"
+            echo "ROOT_LINE=KernelSU 32736 (vendored)" >> "$GITHUB_ENV"
             exit 0
           fi
 
@@ -186,11 +205,44 @@ jobs:
 
           echo "KSU_VERSION=${KSU_VERSION}" >> "$GITHUB_ENV"
           echo "KSU_COMMIT=${KSU_COMMIT}" >> "$GITHUB_ENV"
+          echo "ROOT_LINE=KernelSU ${KSU_VERSION} (${KSU_COMMIT:0:8})" >> "$GITHUB_ENV"
           echo "Integrated tiann/KernelSU main (${KSU_COMMIT:0:12}, KSU_VERSION=${KSU_VERSION})"
+
+      - name: Fetch & integrate Baka-SU/BakaSU (main) with native SUSFS inline hooks
+        if: matrix.root_flavor == 'bakasu'
+        run: |
+          set -euo pipefail
+          echo "ROOT_NAME=BakaSU" >> "$GITHUB_ENV"
+          echo "ROOT_REPO=Baka-SU/BakaSU" >> "$GITHUB_ENV"
+
+          BAKASU_DIR="${GITHUB_WORKSPACE}/BakaSU"
+          rm -rf "$BAKASU_DIR" drivers/kernelsu
+          git clone --single-branch -b main https://github.com/Baka-SU/BakaSU.git "$BAKASU_DIR"
+
+          KSU_COMMIT="$(git -C "$BAKASU_DIR" rev-parse HEAD)"
+          KSU_COUNT="$(git -C "$BAKASU_DIR" rev-list --count HEAD)"
+          # Match BakaSU/kernel/Kbuild formula: 30000 + rev-list + 700
+          KSU_VERSION="$((30000 + KSU_COUNT + 700))"
+          echo "Fetched Baka-SU/BakaSU main @ ${KSU_COMMIT} (count=${KSU_COUNT} -> KSU_VERSION=${KSU_VERSION})"
+
+          # Defensive guard if upstream ever re-adds an unconditional wait error in susfs_compat.mk
+          if grep -q 'Please wait susfs update' "$BAKASU_DIR/kernel/tools/susfs_compat.mk" 2>/dev/null; then
+            sed -i '/Please wait susfs update/d' "$BAKASU_DIR/kernel/tools/susfs_compat.mk"
+          fi
+
+          # Symlink drivers/kernelsu -> ../BakaSU/kernel (preserves ../.git & include/uapi -> ../../uapi)
+          ln -s ../BakaSU/kernel drivers/kernelsu
+          ls -la drivers/kernelsu drivers/kernelsu/include/uapi
+
+          echo "KSU_VERSION=${KSU_VERSION}" >> "$GITHUB_ENV"
+          echo "KSU_COMMIT=${KSU_COMMIT}" >> "$GITHUB_ENV"
+          echo "ROOT_LINE=BakaSU ${KSU_VERSION} (${KSU_COMMIT:0:8})" >> "$GITHUB_ENV"
+          echo "Integrated Baka-SU/BakaSU main (${KSU_COMMIT:0:12}, KSU_VERSION=${KSU_VERSION})"
 
       - name: Compile 6.6.163-tarostream Image & Module.symvers
         env:
           LTO_MODE: ${{ inputs.lto_mode || 'thin' }}
+          ROOT_FLAVOR: ${{ matrix.root_flavor }}
         run: |
           set -euo pipefail
           MAKE_ARGS=(
@@ -202,17 +254,40 @@ jobs:
             LOCALVERSION=
             KBUILD_BUILD_USER=tarostream
             KBUILD_BUILD_HOST=tarostream
-            KSU_VERSION="${KSU_VERSION}"
           )
+          if [ "$ROOT_FLAVOR" = "kernelsu" ]; then
+            MAKE_ARGS+=(KSU_VERSION="${KSU_VERSION}")
+          fi
+
           mkdir -p out
           make "${MAKE_ARGS[@]}" gki_defconfig
+
+          # BakaSU hooking method is a Kconfig choice defaulting to KSU_TRACEPOINT_HOOK;
+          # explicitly enforce KSU_SUSFS inline hooks for our SUSFS v2.4.0 kernel tree.
+          if [ "$ROOT_FLAVOR" = "bakasu" ]; then
+            scripts/config --file out/.config \
+              -d KSU_TRACEPOINT_HOOK \
+              -d KSU_MANUAL_HOOK \
+              -e KSU_SUSFS \
+              -e KSU_SUSFS_SUS_PATH \
+              -e KSU_SUSFS_SUS_MOUNT \
+              -e KSU_SUSFS_SUS_KSTAT \
+              -e KSU_SUSFS_SPOOF_UNAME \
+              -e KSU_SUSFS_ENABLE_LOG \
+              -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+              -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+              -e KSU_SUSFS_OPEN_REDIRECT \
+              -e KSU_SUSFS_SUS_MAP \
+              -e KSU_SUSFS_PRIORITY_UID_FILTER
+            make "${MAKE_ARGS[@]}" olddefconfig
+          fi
 
           if [ "$LTO_MODE" = "none" ]; then
             scripts/config --file out/.config -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE
             make "${MAKE_ARGS[@]}" olddefconfig
           fi
 
-          # Install UAPI headers first so KernelSU Kbuild enables preinit/runner.elf cleanly
+          # Install UAPI headers first so KernelSU/BakaSU Kbuild enables preinit/runner.elf cleanly
           make -j"$(nproc)" "${MAKE_ARGS[@]}" headers_install
 
           # Build Image + in-tree modules so Module.symvers is generated for ABI verification
@@ -220,49 +295,156 @@ jobs:
 
           ls -lh out/arch/arm64/boot/Image out/Module.symvers out/vmlinux.symvers || true
 
-      - name: Run CI Boot-Safety Gate
+      - name: Auto-fetch matching Manager APK
+        env:
+          ROOT_FLAVOR: ${{ matrix.root_flavor }}
         run: |
           set -euo pipefail
-          python3 .github/scripts/verify_boot_safety.py \
-            --src . \
-            --out out \
-            --report out/boot-safety-report.txt
+          APK_STAGE="${RUNNER_TEMP}/manager-apk"
+          rm -rf "$APK_STAGE"
+          mkdir -p "$APK_STAGE"
 
-      - name: Package AnyKernel3 flashable ZIP
+          if [ "$ROOT_FLAVOR" = "kernelsu" ]; then
+            echo "Fetching latest tiann/KernelSU Manager APK from GitHub Actions via nightly.link..."
+            RUN_JSON="$(curl -fsSL --retry 5 --retry-delay 5 \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/tiann/KernelSU/actions/workflows/build-manager.yml/runs?branch=main&status=success&per_page=1")"
+            RUN_ID="$(python3 -c 'import sys,json; r=json.load(sys.stdin)["workflow_runs"]; print(r[0]["id"] if r else "")' <<< "$RUN_JSON")"
+            RUN_SHA="$(python3 -c 'import sys,json; r=json.load(sys.stdin)["workflow_runs"]; print(r[0]["head_sha"][:8] if r else "")' <<< "$RUN_JSON")"
+
+            FETCHED_APK=""
+            if [ -n "$RUN_ID" ]; then
+              echo "Latest tiann/KernelSU build-manager.yml run: ${RUN_ID} (${RUN_SHA})"
+              if curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
+                "https://nightly.link/tiann/KernelSU/actions/runs/${RUN_ID}/manager.zip" \
+                -o "${APK_STAGE}/manager.zip"; then
+                unzip -qo "${APK_STAGE}/manager.zip" -d "${APK_STAGE}/extracted"
+                FETCHED_APK="$(find "${APK_STAGE}/extracted" -type f -name '*.apk' | head -n1 || true)"
+              fi
+            fi
+
+            if [ -z "$FETCHED_APK" ]; then
+              echo "nightly.link fallback: fetching latest tiann/KernelSU GitHub Release APK..."
+              REL_URL="$(curl -fsSL --retry 5 --retry-delay 5 \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/tiann/KernelSU/releases/latest" \
+                | python3 -c 'import sys,json; assets=json.load(sys.stdin).get("assets",[]); print(next((a["browser_download_url"] for a in assets if a["name"].endswith(".apk")), ""))')"
+              [ -n "$REL_URL" ] || { echo "ERROR: Could not locate KernelSU Manager APK" >&2; exit 1; }
+              mkdir -p "${APK_STAGE}/extracted"
+              FETCHED_APK="${APK_STAGE}/extracted/$(basename "$REL_URL")"
+              curl -fsSL --retry 5 --retry-delay 5 "$REL_URL" -o "$FETCHED_APK"
+            fi
+
+            ORIG_NAME="$(basename "$FETCHED_APK")"
+            VER_TAG="$(echo "$ORIG_NAME" | sed -E 's/^KernelSU_//; s/-release\.apk$//; s/\.apk$//')"
+            APK_FINAL_NAME="KernelSU-Manager-${VER_TAG}.apk"
+            APK_SOURCE="tiann/KernelSU CI run ${RUN_ID:-release} (${ORIG_NAME})"
+          else
+            echo "Fetching latest Baka-SU/BakaSU Manager APK from GitHub Actions via nightly.link..."
+            RUN_JSON="$(curl -fsSL --retry 5 --retry-delay 5 \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/Baka-SU/BakaSU/actions/workflows/build-manager.yml/runs?branch=main&status=success&per_page=1")"
+            RUN_ID="$(python3 -c 'import sys,json; r=json.load(sys.stdin)["workflow_runs"]; print(r[0]["id"] if r else "")' <<< "$RUN_JSON")"
+            RUN_SHA="$(python3 -c 'import sys,json; r=json.load(sys.stdin)["workflow_runs"]; print(r[0]["head_sha"][:8] if r else "")' <<< "$RUN_JSON")"
+            [ -n "$RUN_ID" ] || { echo "ERROR: No successful Baka-SU/BakaSU build-manager.yml run found" >&2; exit 1; }
+            echo "Latest Baka-SU/BakaSU build-manager.yml run: ${RUN_ID} (${RUN_SHA})"
+
+            curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
+              "https://nightly.link/Baka-SU/BakaSU/actions/runs/${RUN_ID}/Manager-release.zip" \
+              -o "${APK_STAGE}/Manager-release.zip"
+            unzip -qo "${APK_STAGE}/Manager-release.zip" -d "${APK_STAGE}/extracted"
+            ls -lh "${APK_STAGE}/extracted"
+
+            # Prefer arm64-v8a release APK for Xiaomi 15 (SM8750), fallback to universal
+            FETCHED_APK="$(find "${APK_STAGE}/extracted" -type f -name '*arm64-v8a*.apk' | head -n1 || true)"
+            if [ -z "$FETCHED_APK" ]; then
+              FETCHED_APK="$(find "${APK_STAGE}/extracted" -type f -name '*universal*.apk' | head -n1 || true)"
+            fi
+            if [ -z "$FETCHED_APK" ]; then
+              FETCHED_APK="$(find "${APK_STAGE}/extracted" -type f -name '*.apk' | head -n1 || true)"
+            fi
+            [ -n "$FETCHED_APK" ] || { echo "ERROR: No APK found inside Manager-release.zip" >&2; exit 1; }
+
+            ORIG_NAME="$(basename "$FETCHED_APK")"
+            VER_TAG="$(echo "$ORIG_NAME" | sed -E 's/^BakaSU_//; s/-release\.apk$//; s/\.apk$//')"
+            APK_FINAL_NAME="BakaSU-Manager-${VER_TAG}.apk"
+            APK_SOURCE="Baka-SU/BakaSU CI run ${RUN_ID} (${ORIG_NAME})"
+          fi
+
+          # Verify APK integrity (valid ZIP archive & > 1 MiB)
+          unzip -tq "$FETCHED_APK"
+          APK_BYTES="$(stat -c%s "$FETCHED_APK")"
+          if [ "$APK_BYTES" -lt 1048576 ]; then
+            echo "ERROR: Fetched APK is unexpectedly small (${APK_BYTES} bytes): ${FETCHED_APK}" >&2
+            exit 1
+          fi
+          cp -f "$FETCHED_APK" "${APK_STAGE}/${APK_FINAL_NAME}"
+          APK_SHA256="$(sha256sum "${APK_STAGE}/${APK_FINAL_NAME}" | awk '{print $1}')"
+          echo "Verified ${APK_FINAL_NAME} (${APK_BYTES} bytes, sha256=${APK_SHA256})"
+
+          echo "APK_FINAL_PATH=${APK_STAGE}/${APK_FINAL_NAME}" >> "$GITHUB_ENV"
+          echo "APK_FINAL_NAME=${APK_FINAL_NAME}" >> "$GITHUB_ENV"
+          echo "APK_SOURCE=${APK_SOURCE}" >> "$GITHUB_ENV"
+          echo "APK_SHA256=${APK_SHA256}" >> "$GITHUB_ENV"
+
+      - name: Prepare AnyKernel3 script & run CI Boot-Safety Gate
+        env:
+          ROOT_FLAVOR: ${{ matrix.root_flavor }}
         run: |
           set -euo pipefail
-          SHORT_SHA="${GITHUB_SHA:0:7}"
-          ZIP_NAME="AnyKernel3-tarostream-6.6.163-${SHORT_SHA}.zip"
           AK3_DIR="${RUNNER_TEMP}/AnyKernel3"
-          OUT_ART="${GITHUB_WORKSPACE}/artifacts"
-          rm -rf "$AK3_DIR" "$OUT_ART"
-          mkdir -p "$OUT_ART"
-
+          rm -rf "$AK3_DIR"
           git clone --depth=1 -b gki-2.0 https://github.com/WildKernels/AnyKernel3.git "$AK3_DIR"
-          rm -rf "$AK3_DIR/.git" "$AK3_DIR/README.md" "$AK3_DIR/anykernel.sh"
+          # Remove WildKernels maple leaf banner so ONLY our mobile-safe Lloyd ASCII banner prints
+          rm -rf "$AK3_DIR/.git" "$AK3_DIR/README.md" "$AK3_DIR/anykernel.sh" "$AK3_DIR/banner"
           cp -f .github/anykernel/anykernel.sh "$AK3_DIR/anykernel.sh"
           sed -i \
-            -e "s|__KSU_VERSION__|${KSU_VERSION} (${KSU_COMMIT:0:8})|g" \
+            -e "s|__ROOT_NAME__|${ROOT_NAME}|g" \
+            -e "s|__ROOT_LINE__|${ROOT_LINE}|g" \
             -e "s|__BUILD_SHA__|${SHORT_SHA}|g" \
             -e "s|__CLANG_VER__|${CLANG_VERSION}|g" \
             "$AK3_DIR/anykernel.sh"
           chmod 0755 "$AK3_DIR/anykernel.sh"
-          cp -f out/arch/arm64/boot/Image "$AK3_DIR/Image"
 
+          # Validate compiled Image, .config, F2FS parity, 9593/9593 ABI CRCs, AND rendered anykernel.sh banner
+          python3 .github/scripts/verify_boot_safety.py \
+            --src . \
+            --out out \
+            --root-flavor "${ROOT_FLAVOR}" \
+            --anykernel "$AK3_DIR/anykernel.sh" \
+            --report out/boot-safety-report.txt
+
+      - name: Package AnyKernel3 flashable ZIP & Manager APK bundle
+        env:
+          ROOT_FLAVOR: ${{ matrix.root_flavor }}
+        run: |
+          set -euo pipefail
+          ZIP_NAME="AnyKernel3-tarostream-6.6.163-${ROOT_FLAVOR}-${SHORT_SHA}.zip"
+          AK3_DIR="${RUNNER_TEMP}/AnyKernel3"
+          OUT_ART="${GITHUB_WORKSPACE}/artifacts"
+          rm -rf "$OUT_ART"
+          mkdir -p "$OUT_ART"
+
+          # Double-check WildKernels maple leaf banner is absent
+          test ! -e "$AK3_DIR/banner"
+
+          cp -f out/arch/arm64/boot/Image "$AK3_DIR/Image"
           (cd "$AK3_DIR" && zip -r9 "${OUT_ART}/${ZIP_NAME}" .)
           (cd "$OUT_ART" && sha256sum "${ZIP_NAME}" > "${ZIP_NAME}.sha256")
-          cp -f out/.config "${OUT_ART}/tarostream-6.6.163-${SHORT_SHA}.config"
+          cp -f out/.config "${OUT_ART}/tarostream-6.6.163-${ROOT_FLAVOR}-${SHORT_SHA}.config"
           cp -f out/boot-safety-report.txt "${OUT_ART}/boot-safety-report.txt"
+          cp -f "${APK_FINAL_PATH}" "${OUT_ART}/${APK_FINAL_NAME}"
           ls -lh "$OUT_ART"
 
           {
-            echo "## 6.6.163-tarostream Build Summary"
+            echo "## 6.6.163-tarostream Build Summary (\`${ROOT_FLAVOR}\`)"
             echo ""
-            echo "- **Artifact:** \`${ZIP_NAME}\`"
+            echo "- **AnyKernel3 ZIP:** \`${ZIP_NAME}\`"
+            echo "- **Manager APK:** \`${APK_FINAL_NAME}\` (source: \`${APK_SOURCE}\`, sha256: \`${APK_SHA256:0:16}...\`)"
             echo "- **Kernel:** \`$(sed -n 's/.*"\\([^"]*\\)".*/\\1/p' out/include/generated/utsrelease.h)\`"
             echo "- **Toolchain:** \`${CLANG_VERSION}\` (\`${CLANG_VER_STR}\`)"
-            echo "- **KernelSU:** \`tiann/KernelSU\` main @ \`${KSU_COMMIT:0:12}\` (\`KSU_VERSION=${KSU_VERSION}\`)"
-            echo "- **Features:** SUSFS v2.4.0 + NoMount + DroidSpaces + BORE + ADIOS + NTsync + Thermal/Power Efficiency"
+            echo "- **Root:** \`${ROOT_REPO}\` main @ \`${KSU_COMMIT:0:12}\` (\`KSU_VERSION=${KSU_VERSION}\`)"
+            echo "- **Stack:** SUSFS v2.4.0 + NoMount + DroidSpaces + Pure EEVDF/WALT + AMU + TEO + BBR/FQ + ADIOS + NTsync"
             echo ""
             echo '```text'
             cat out/boot-safety-report.txt
@@ -271,10 +453,10 @@ jobs:
 
           echo "ZIP_NAME=${ZIP_NAME}" >> "$GITHUB_ENV"
 
-      - name: Upload AnyKernel3 ZIP & verification artifacts
+      - name: Upload AnyKernel3 ZIP, Manager APK & verification artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: AnyKernel3-tarostream-6.6.163-${{ github.sha }}
+          name: AnyKernel3-tarostream-6.6.163-${{ matrix.root_flavor }}-${{ steps.meta.outputs.short_sha }}
           path: artifacts/**
           if-no-files-found: error
           retention-days: 30

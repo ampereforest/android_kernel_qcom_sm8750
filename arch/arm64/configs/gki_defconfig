@@ -65,6 +65,7 @@ CONFIG_SWP_EMULATION=y
 CONFIG_CP15_BARRIER_EMULATION=y
 CONFIG_SETEND_EMULATION=y
 CONFIG_ARM64_PMEM=y
+CONFIG_ARM64_AMU_EXTN=y
 # CONFIG_ARM64_BTI_KERNEL is not set
 CONFIG_RANDOMIZE_BASE=y
 # CONFIG_RANDOMIZE_MODULE_REGION_FULL is not set
@@ -166,6 +167,9 @@ CONFIG_TCP_CONG_ADVANCED=y
 # CONFIG_TCP_CONG_WESTWOOD is not set
 # CONFIG_TCP_CONG_HTCP is not set
 CONFIG_TCP_CONG_BBR=y
+CONFIG_DEFAULT_BBR=y
+# CONFIG_DEFAULT_CUBIC is not set
+CONFIG_DEFAULT_TCP_CONG="bbr"
 CONFIG_IPV6_ROUTER_PREF=y
 CONFIG_IPV6_ROUTE_INFO=y
 CONFIG_IPV6_OPTIMISTIC_DAD=y
@@ -806,13 +810,10 @@ CONFIG_PANIC_TIMEOUT=-1
 CONFIG_SOFTLOCKUP_DETECTOR=y
 CONFIG_WQ_WATCHDOG=y
 CONFIG_SCHEDSTATS=y
-CONFIG_SCHED_BORE=y
-# The stock HyperOS 4 kernel has no BORE at all: no sched_bore,
-# sched_burst_* or reset_task_bore symbols in its kallsyms, and it does
-# still have sched_update_scaling() and normalized_sysctl_sched_base_slice,
-# which the BORE patch compiles out. With BORE the base slice becomes
-# nsecs_per_tick * DIV_ROUND_UP(min_base_slice, nsecs_per_tick) = 4 ms on an
-# 8-CPU HZ-250 system, instead of stock's 0.7 ms * (1+ilog2(8)) = 2.8 ms.
+# CONFIG_SCHED_BORE is not set
+# Pure upstream Linux 6.6 EEVDF + Qualcomm WALT: avoids BORE burst-inflation
+# on routine UI touches/scrolls while preserving full WALT scaling, ColorOS
+# CPU boost, and uncapped 3.53/4.32 GHz CPU & 1,100 MHz GPU clocks.
 CONFIG_HIST_TRIGGERS=y
 CONFIG_PID_IN_CONTEXTIDR=y
 CONFIG_KUNIT=m

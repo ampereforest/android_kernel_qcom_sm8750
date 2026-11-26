@@ -5,7 +5,7 @@
 ### AnyKernel setup
 # global properties
 properties() { '
-kernel.string=tarostream 6.6.163 (tiann/KernelSU + SUSFS + NoMount + DroidSpaces)
+kernel.string=tarostream 6.6.163 (__ROOT_NAME__ + SUSFS + NoMount + DroidSpaces)
 do.devicecheck=0
 do.modules=0
 do.systemless=0
@@ -42,15 +42,41 @@ case $kernel_version in
 esac
 
 ui_print " "
+# BEGIN LLOYD BANNER
+ui_print "           .=- :--====+==-:.                 "
+ui_print "           :-=====++++++*#*#%+-:             "
+ui_print "           -==++++++**+++**++++++=:.         "
+ui_print "        .--+++*#**+++++==============-:..    "
+ui_print "       :***+++*+++-===: -=.==-=====:-=::..   "
+ui_print "       **+++++===-==::=+.=.-=-:-====..::     "
+ui_print "      =++++-====::: ::%#-=.:=- :.=.+=.       "
+ui_print "    .-==--::---=:..++=##%:..=* ..-.--:       "
+ui_print "   .-:....:-.::-..:+-=.*@-:.=#=+ .::::       "
+ui_print "     .::::.. ..:.:%@-=-@#%+-*-.:..:::.       "
+ui_print "      .:::.==+ ..:#@@@@@@@%@*-=*..::.        "
+ui_print "       ..:.* #*--:#@@@@@@@@@%@@#.:..         "
+ui_print "         . .=*%@@@@@@@@@@@@@@@%:             "
+ui_print "      ......   .*@@%@@@@@#*@@@@-..==.    ..  "
+ui_print "       .:..=+=.:+@@%@@@@@@@@@#-  .-##+..=#*. "
+ui_print "           *=-#@@@@%:=*#@@%#*.     =##: :**+ "
+ui_print "           ====:-=*#-    ##%%#:    -*#++%+*= "
+ui_print "         ::::-:.    == :+*++-.   :*%%%%@%##= "
+ui_print "       +@@@%%*==-:-..:-++=*-:=*: +%%%=-:+#**="
+ui_print "      -=%%%##%#::.:%#:..:%=*::*#-*####%##*=--"
+ui_print "      .=%%%#-:+==*=:%*:-=++=-::*#:+######*##*"
+ui_print "      .+####%#-=+**+==:.--:.=++=#+:=**=-+*+=:"
+ui_print "       =#####%%#*++=++**.:=:=+++-#=#+*****=  "
+ui_print "       -*:++=:..:-=-=:=++---=+=+=--:=+++++=  "
+# END LLOYD BANNER
 ui_print "=============================================="
-ui_print "  tarostream GKI Drop-In Kernel (6.6.163)     "
-ui_print "  Target : Xiaomi 15 (dada / SM8750)          "
-ui_print "  Root   : tiann/KernelSU (__KSU_VERSION__)   "
-ui_print "  Stack  : SUSFS v2.4.0 + NoMount + DroidSpaces"
-ui_print "  Build  : __BUILD_SHA__ (__CLANG_VER__)      "
+ui_print "  tarostream 6.6.163 (Xiaomi 15 / SM8750)"
+ui_print "  Root  : __ROOT_LINE__"
+ui_print "  Stack : SUSFS 2.4 + NoMount + DroidSpaces"
+ui_print "  Sched : EEVDF+WALT | BBR+FQ | TEO | AMU"
+ui_print "  Build : __BUILD_SHA__ (__CLANG_VER__)"
 ui_print "=============================================="
-ui_print "  Running kernel: $kernel_version (supported: $gki_supported)"
-$gki_supported || abort "  -> Unsupported non-6.6 kernel base ($kernel_version), aborting."
+ui_print "  Running: $kernel_version (ok: $gki_supported)"
+$gki_supported || abort "  -> Non-6.6 kernel ($kernel_version), abort."
 
 # boot install (Image-only drop-in; preserves stock vendor_boot & vendor_dlkm)
 split_boot
@@ -63,6 +89,6 @@ else
 fi
 
 ui_print " "
-ui_print "  -> tarostream 6.6.163 flashed cleanly to boot!"
-ui_print "  -> Stock vendor_boot & vendor_dlkm preserved."
+ui_print "  -> tarostream 6.6.163 flashed to boot!"
+ui_print "  -> Stock vendor_boot & vendor_dlkm kept."
 ui_print " "

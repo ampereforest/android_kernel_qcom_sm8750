@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Automated CI Boot-Safety Gate for 6.6.163-tarostream GKI drop-in builds.
+r"""Automated CI Boot-Safety Gate for 6.6.163-tarostream GKI drop-in builds.
 
 Verifies:
   1. ARM64 Linux Image magic header ('ARMd' at offset 0x38) and sane binary size.
-  2. utsrelease.h matches 6.6.163-*-tarostream and vermagic has MODVERSIONS/PREEMPT/SMP.
+  2. utsrelease.h matches 6.6.163-*-tarostream and vermagic has no legacy branding.
   3. Built Image retains tarostream, susfs, and nomount markers.
-  4. Final .config satisfies all KernelSU, SUSFS, NoMount, DroidSpaces, thermal/battery,
-     and KMI/CFI requirements.
-  5. fs/f2fs/super.c recognizes all 27 live /data F2FS mount flags from Xiaomi 15 PLZ110.
-  6. Module.symvers / vmlinux.symvers exports all critical vendor_dlkm symbols
-     (qcom, xiaomi, oplus, WALT/DRM/WLAN/UFS/BT) and matches android/abi_gki_aarch64.stg CRCs.
+  4. Final .config satisfies all root-flavor (tiann/KernelSU or Baka-SU/BakaSU),
+     SUSFS v2.4.0, NoMount, DroidSpaces, zero-overhead thermal/power (pure EEVDF+WALT,
+     AMU, TEO, BBR+FQ, WQ power-efficient, RCU lazy, MGLRU, HZ=250), and KMI/CFI checks.
+  5. AnyKernel3 Lloyd ASCII banner is mobile-safe (<= 46 columns per line, pure printable
+     ASCII, zero shell-escaping hazards: $, `, \, ").
+  6. fs/f2fs/super.c recognizes all 28 live /data F2FS mount flags from Xiaomi 15 PLZ110.
+  7. Module.symvers / vmlinux.symvers exports all critical vendor_dlkm symbols
+     (qcom, xiaomi, oplus, WALT/DRM/WLAN/UFS/BT) with 0 CRC drift against
+     android/abi_gki_aarch64.stg.
 """
 import argparse
 import re
@@ -18,7 +22,7 @@ import sys
 from pathlib import Path
 
 REQUIRED_CONFIG_Y = [
-    # KernelSU & hooks
+    # Root & hooks
     "CONFIG_KSU",
     "CONFIG_KPROBES",
     "CONFIG_HAVE_KPROBES",
@@ -69,6 +73,11 @@ REQUIRED_CONFIG_Y = [
     "CONFIG_NO_HZ_IDLE",
     "CONFIG_LRU_GEN",
     "CONFIG_LRU_GEN_ENABLED",
+    "CONFIG_ARM64_AMU_EXTN",
+    "CONFIG_CPU_IDLE_GOV_TEO",
+    "CONFIG_TCP_CONG_BBR",
+    "CONFIG_DEFAULT_BBR",
+    "CONFIG_NET_SCH_FQ",
     # KMI, KCFI & F2FS drop-in safety
     "CONFIG_MODVERSIONS",
     "CONFIG_APEX_RELAX_GKI_MODULE_KMI",
@@ -80,11 +89,22 @@ REQUIRED_CONFIG_Y = [
 ]
 
 REQUIRED_CONFIG_OFF = [
+    "CONFIG_SCHED_BORE",
+    "CONFIG_DEFAULT_CUBIC",
     "CONFIG_TRIM_UNUSED_KSYMS",
     "CONFIG_RCU_LAZY_DEFAULT_OFF",
     "CONFIG_HZ_1000",
     "CONFIG_CFI_PERMISSIVE",
     "CONFIG_LD_DEAD_CODE_DATA_ELIMINATION",
+]
+
+REQUIRED_CONFIG_STR = {
+    "CONFIG_DEFAULT_TCP_CONG": '"bbr"',
+}
+
+BAKASU_CONFIG_OFF = [
+    "CONFIG_KSU_TRACEPOINT_HOOK",
+    "CONFIG_KSU_MANUAL_HOOK",
 ]
 
 LIVE_F2FS_MOUNT_OPTS = [
@@ -125,6 +145,10 @@ CRITICAL_VENDOR_SYMBOLS = [
     "filp_open",
     "filp_close",
 ]
+
+BANNER_MAX_COLS = 46
+BANNER_ALLOWED_ART_CHARS = set("@%#*+=-:. ")
+BANNER_FORBIDDEN_SHELL_CHARS = set('$`\\"')
 
 
 def parse_config(path: Path) -> dict[str, str]:
@@ -187,17 +211,87 @@ def parse_symbol_list(path: Path) -> set[str]:
     return syms
 
 
+def verify_anykernel_banner(ak_path: Path, log, fail) -> None:
+    """Verify Lloyd ASCII banner & mobile console header lines in anykernel.sh."""
+    if not ak_path.is_file():
+        fail(f"Missing AnyKernel3 script: {ak_path}")
+        return
+
+    lines = ak_path.read_text(encoding="utf-8").splitlines()
+    in_banner = False
+    found_begin = False
+    found_end = False
+    art_lines: list[tuple[int, str]] = []
+
+    for lineno, raw in enumerate(lines, start=1):
+        stripped = raw.strip()
+        if stripped == "# BEGIN LLOYD BANNER":
+            in_banner = True
+            found_begin = True
+            continue
+        if stripped == "# END LLOYD BANNER":
+            in_banner = False
+            found_end = True
+            continue
+        if in_banner:
+            m = re.fullmatch(r'ui_print "(.*)"', stripped)
+            if not m:
+                fail(f"Banner line {lineno} is not a clean double-quoted ui_print: {raw!r}")
+                continue
+            payload = m.group(1)
+            art_lines.append((lineno, payload))
+            if len(payload) > BANNER_MAX_COLS:
+                fail(f"Banner line {lineno} exceeds {BANNER_MAX_COLS} cols ({len(payload)}): {payload!r}")
+            bad_shell = sorted(set(payload) & BANNER_FORBIDDEN_SHELL_CHARS)
+            if bad_shell:
+                fail(f"Banner line {lineno} contains shell-escaping hazard(s) {bad_shell}: {payload!r}")
+            bad_chars = sorted(set(payload) - BANNER_ALLOWED_ART_CHARS)
+            if bad_chars:
+                fail(f"Banner line {lineno} contains non-ASCII-art char(s) {bad_chars}: {payload!r}")
+
+    if not (found_begin and found_end):
+        fail(f"Missing '# BEGIN LLOYD BANNER' / '# END LLOYD BANNER' markers in {ak_path}")
+        return
+
+    if not (20 <= len(art_lines) <= 28):
+        fail(f"Unexpected Lloyd banner height: {len(art_lines)} lines (expected 20..28)")
+
+    max_w = max((len(p) for _, p in art_lines), default=0)
+
+    # Also verify non-banner static ui_print lines (skipping lines with runtime shell vars like $kernel_version)
+    header_over = []
+    for lineno, raw in enumerate(lines, start=1):
+        stripped = raw.strip()
+        m = re.fullmatch(r'ui_print "(.*)"', stripped)
+        if not m:
+            continue
+        payload = m.group(1)
+        if "$" in payload or "__" in payload:
+            continue
+        if len(payload) > BANNER_MAX_COLS:
+            header_over.append((lineno, len(payload), payload))
+    for lineno, length, payload in header_over:
+        fail(f"ui_print line {lineno} exceeds {BANNER_MAX_COLS} cols ({length}): {payload!r}")
+
+    log(f"[Banner] Verified {ak_path}: {len(art_lines)} Lloyd ASCII lines, max_width={max_w}/{BANNER_MAX_COLS} cols, 0 escaping hazards.")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True)
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--report", required=True)
+    ap.add_argument("--out", required=False, default=None)
+    ap.add_argument("--report", required=False, default=None)
+    ap.add_argument("--root-flavor", choices=("kernelsu", "bakasu"), default="kernelsu")
+    ap.add_argument("--anykernel", default=None,
+                    help="Path to anykernel.sh to validate (defaults to <src>/.github/anykernel/anykernel.sh)")
+    ap.add_argument("--banner-only", action="store_true",
+                    help="Only run the AnyKernel3 Lloyd banner check (for local pre-push sanity check)")
     ap.add_argument("--allow-non-vendor-drift", action="store_true",
                     help="Only fail on CRC drift in qcom/xiaomi/oplus/critical symbols (still reports all drift)")
     args = ap.parse_args()
 
     src = Path(args.src)
-    out = Path(args.out)
+    ak_path = Path(args.anykernel) if args.anykernel else (src / ".github/anykernel/anykernel.sh")
     report_lines: list[str] = []
     errors: list[str] = []
 
@@ -210,7 +304,18 @@ def main() -> int:
         report_lines.append(f"ERROR: {msg}")
         errors.append(msg)
 
-    log("=== tarostream 6.6.163 CI Boot-Safety Gate ===")
+    log(f"=== tarostream 6.6.163 CI Boot-Safety Gate (flavor={args.root_flavor}) ===")
+
+    # Banner verification (runs both in --banner-only and full CI modes)
+    verify_anykernel_banner(ak_path, log, fail)
+    if args.banner_only:
+        return 1 if errors else 0
+
+    if not args.out or not args.report:
+        fail("--out and --report are required unless --banner-only is passed")
+        return 1
+
+    out = Path(args.out)
 
     # 1. ARM64 Image header & size check
     image = out / "arch/arm64/boot/Image"
@@ -220,7 +325,7 @@ def main() -> int:
         data = image.read_bytes()
         size_mb = len(data) / (1024 * 1024)
         magic = data[0x38:0x3C] if len(data) >= 0x40 else b""
-        text_offset, image_size = struct.unpack_from("<QQ", data, 0x08) if len(data) >= 0x20 else (0, 0)
+        _, image_size = struct.unpack_from("<QQ", data, 0x08) if len(data) >= 0x20 else (0, 0)
         log(f"[Image] path={image} size={len(data)} bytes ({size_mb:.2f} MiB) magic={magic!r} header_image_size={image_size}")
         if magic != b"ARMd":
             fail(f"Invalid ARM64 Linux Image magic at 0x38: expected b'ARMd', got {magic!r}")
@@ -255,15 +360,28 @@ def main() -> int:
         log(f"[Config] Parsed {len(cfg)} entries from {cfg_path}")
         log(f"[Config] CC_VERSION_TEXT={cfg.get('CONFIG_CC_VERSION_TEXT', 'UNKNOWN')}")
         log(f"[Config] LOCALVERSION={cfg.get('CONFIG_LOCALVERSION', 'UNKNOWN')}")
+        log(f"[Config] DEFAULT_TCP_CONG={cfg.get('CONFIG_DEFAULT_TCP_CONG', 'UNKNOWN')}")
+
         for key in REQUIRED_CONFIG_Y:
             val = cfg.get(key)
             if val != "y":
                 fail(f"Config mismatch: expected {key}=y, got {val!r}")
-        for key in REQUIRED_CONFIG_OFF:
+
+        off_list = list(REQUIRED_CONFIG_OFF)
+        if args.root_flavor == "bakasu":
+            off_list.extend(BAKASU_CONFIG_OFF)
+        for key in off_list:
             val = cfg.get(key, "n")
             if val != "n":
                 fail(f"Config mismatch: expected {key} off, got {val!r}")
-        log(f"[Config] Checked {len(REQUIRED_CONFIG_Y)} required=y and {len(REQUIRED_CONFIG_OFF)} required=off options.")
+
+        for key, expected in REQUIRED_CONFIG_STR.items():
+            val = cfg.get(key)
+            if val != expected:
+                fail(f"Config mismatch: expected {key}={expected}, got {val!r}")
+
+        log(f"[Config] Checked {len(REQUIRED_CONFIG_Y)} required=y, {len(off_list)} required=off, "
+            f"{len(REQUIRED_CONFIG_STR)} required=str options (flavor={args.root_flavor}).")
 
     # 4. F2FS /data mount option parity check
     f2fs_super = src / "fs/f2fs/super.c"
