@@ -3881,6 +3881,9 @@ static void reweight_eevdf(struct sched_entity *se, u64 avruntime,
 	se->deadline = avruntime + vslice;
 }
 
+#ifndef CONFIG_SCHED_BORE
+static
+#endif
 void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 			    unsigned long weight)
 {
@@ -5333,12 +5336,12 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 	se->vruntime = vruntime - lag;
 
+#ifdef CONFIG_SCHED_BORE
 	if (likely(se->bore_stats) && se->bore_stats->rel_deadline) {
 		se->deadline += se->vruntime;
 		se->bore_stats->rel_deadline = 0;
 		return;
 	}
-#ifdef CONFIG_SCHED_BORE
 	else if (likely(sched_bore))
 		vslice >>= !!(flags & sched_deadline_boost_mask);
 	else
@@ -5453,7 +5456,9 @@ static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq);
 static void
 dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
+#ifdef CONFIG_SCHED_BORE
 	bool sleep = flags & DEQUEUE_SLEEP;
+#endif // CONFIG_SCHED_BORE
 	int action = UPDATE_TG;
 
 	if (entity_is_task(se) && task_on_rq_migrating(task_of(se)))
@@ -5481,10 +5486,12 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	clear_buddies(cfs_rq, se);
 
 	update_entity_lag(cfs_rq, se);
+#ifdef CONFIG_SCHED_BORE
 	if (likely(se->bore_stats) && !sleep) {
 		se->deadline -= se->vruntime;
 		se->bore_stats->rel_deadline = 1;
 	}
+#endif // CONFIG_SCHED_BORE
 
 	if (se != cfs_rq->curr)
 		__dequeue_entity(cfs_rq, se);
@@ -13029,9 +13036,9 @@ static void attach_task_cfs_rq(struct task_struct *p)
 
 static void switched_from_fair(struct rq *rq, struct task_struct *p)
 {
+#ifdef CONFIG_SCHED_BORE
 	if (likely(p->se.bore_stats))
 		p->se.bore_stats->rel_deadline = 0;
-#ifdef CONFIG_SCHED_BORE
 	reset_task_bore(p);
 #endif // CONFIG_SCHED_BORE
 	detach_task_cfs_rq(p);
